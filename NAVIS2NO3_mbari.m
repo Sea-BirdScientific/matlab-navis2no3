@@ -16,7 +16,7 @@
 % 
  
 %% Pathnames
-srcdir = '/Users/ericrehm/OneDrive - Danaher/Sea-Bird/SUNA/src/NAVIS2NO3_MBARI/';
+srcdir = '/Users/ericrehm/OneDrive - Danaher/Sea-Bird/SUNA/src/NAVIS2NO3_MBARI/matlab-navis2no3/';
 datapath = '/Volumes/nasshare/common/dev/D1046-NAVIS/data/';
 % calpath = '/Volumes/nasshare/common/calibration/SUNA-V2/';
 calpath = fullfile(srcdir, 'caltemp/SUNA-V2/');
@@ -84,12 +84,21 @@ cal = parseNO3cal(cal_target);
 
 %% Choose processing option
 cal.ProcessingOption = 'FW';           
+% cal.ProcessingOption = 'NoTS';           
 % cal.ProcessingOption = 'ArgoV1.1'    
 % cal.ProcessingOption = 'ArgoV1.2';
 fprintf(1, 'Processing Option: %s\n', cal.ProcessingOption)
 
 %% Processing options that best reproduce implementations
 switch (cal.ProcessingOption)
+    case 'NoTS'
+        % Current SUNA V2 Firmware (non-APF mode)
+        cal.WL_offset = 210.0; % [nm] (unused_
+        cal.pres_coef = 0.026; % (unused)
+        Pcorr_flag = false;  
+        cal.TSalgorithm = 'None';
+        cal.Nitrate_Sensor_Offset = 0.0;  % No pressure offset in FW
+    
     case 'FW'
         % Current SUNA V2 Firmware (damn close)
         cal.WL_offset = 210.0; % [nm] default

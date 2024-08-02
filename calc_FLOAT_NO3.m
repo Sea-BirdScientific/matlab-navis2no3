@@ -71,7 +71,7 @@ function [NO3] = calc_FLOAT_NO3(spec, ncal, Pcor_flag)
 % ************************************************************************
 % CONSTANTS
 % ************************************************************************
-fig_flag  = 0; % 1 = show nitrate fit
+fig_flag  = 1; % 1 = show nitrate fit
 WL_offset = ncal.WL_offset;  % Optical wavelength offset
 sat_value = 64500; % Pixel intensity saturation limit count
 
@@ -146,9 +146,10 @@ saved_pixels = d.spectra_pix_range(1): d.spectra_pix_range(2); % index
 % THEN TRANSPOSE TO ROWS & REPEAT ROWS SO SAME SIZE AS UV_INTEN
 REF  = ones(rows,1) * ncal.Ref(saved_pixels)';  % Reference intensities
 WL   = ones(rows,1) * ncal.WL(saved_pixels)';   % Wavelengths
-ESW  = ones(rows,1) * ncal.ESW(saved_pixels)';  % Extinction coefs SW
 
-ENO3 = ncal.ENO3(saved_pixels)'; % Extinction coefs NO3 (array)
+ESW  = ncal.ESW(saved_pixels)';    % Extinction coefs SW
+TSWA = ncal.TSWA(saved_pixels)';   % Extinction coefs TS
+ENO3 = ncal.ENO3(saved_pixels)';   % Extinction coefs NO3 (array)
 
 if isfield(ncal,'EHS') % NOT USED YET BUT CARRY ALONG
     EHS  = ncal.EHS(saved_pixels)';  % Extinction coefs HS  (array)
@@ -194,6 +195,9 @@ cal_temp  = ones(rows,cols) * ncal.CalTemp;  % temp isus calibrated at, C
 
 % Temperature / Salinity Correction Algorithm Processing
 switch (ncal.TSalgorithm) 
+    case 'None'
+        fprintf(1, 'No TS Correction\n');
+
     case 'TCSS_Sakamoto2009'
         % SAKAMOTO 2009 TCOR
         % Refer to Computing DAC Nitrate v1.1
@@ -228,20 +232,23 @@ switch (ncal.TSalgorithm)
     otherwise
         error('Unknown TS correction algorithn %s', cal.TSalgorithm);
 end
- 
-% Add pressure corrrection if flag is on
-if Pcor_flag == 1
-    pres_term   = (1- Pint ./ 1000 .* ncal.pres_coef) * ones(1,cols);
-    ESW_in_situ = ESW_in_situ .* pres_term;
+
+
+if (~strcmp(ncal.TSalgorithm, 'None'))
+    % Add pressure corrrection if flag is on
+    if Pcor_flag == 1
+        pres_term   = (1- Pint ./ 1000 .* ncal.pres_coef) * ones(1,cols);
+        ESW_in_situ = ESW_in_situ .* pres_term;
+    end
+    
+    % Estimated SW (bromide) absorbances from salinity
+    ABS_Br_tcor      = ESW_in_situ .* ctd_sal; % in situ bromide absorbances
+    
+    % Remove seawater (bromide) absorbance from sample absorbance (TCSS method)
+    % This leaves nitrate + baseline absorbance by difference
+    ABS_cor = ABS_SW - ABS_Br_tcor  ;    % Eqn. 4
 end
-
-% Estimated SW (bromide) absorbances from salinity
-ABS_Br_tcor      = ESW_in_situ .* ctd_sal; % in situ bromide absorbances
-
-% Remove seawater (bromide) absorbance from sample absorbance (TCSS method)
-% This leaves nitrate + baseline absorbance by difference
-ABS_cor = ABS_SW - ABS_Br_tcor  ;    % Eqn. 4
-clear ctd_temp cal_temp ctd_sal REF ESW pres_term
+clear ctd_temp cal_temp ctd_sal REF pres_term
 
 % ************************************************************************
 % CALCULATE THE NITRATE CONCENTRATION, BASELINE SLOPE AND INTERCEPT OF THE
@@ -257,18 +264,29 @@ t_fit     = saved_pixels >= d.pix_fit_win(1) & ...
             saved_pixels <= d.pix_fit_win(2); % fit win pixel indicies
       
 Fit_WL      = WL(1,t_fit)'; %n x 1
+Fit_ESW     = ESW(t_fit)';  %n x 1   % Used for ncal.TSalgorithm = 'None';
+Fit_TSWA    = TSWA(t_fit)'; %n x 1   % Used for ncal.TSalgorithm = 'None';
 Fit_ENO3    = ENO3(t_fit)'; % n x 1
 Ones        = ones(size(Fit_ENO3));
-Fit_ABS_cor = (ABS_cor(:,t_fit))'; % NO3 + BL. Transposed, now WL x sample
 
-% /1000 & /100 for numerical stability or equalizing weights of unknowns??
+% /1000 & /100 for numerical stability or equalizing weights of unknowns
 % Need to /100 & /1000 at the end to get back to actual baseline and intercept
-M     = [Fit_ENO3 Ones/100 Fit_WL/1000]; % WL x 3
+if (strcmp(ncal.TSalgorithm, 'None'))
+    M     = [Fit_ENO3 Ones/100 Fit_WL/1000 Fit_ESW Fit_TSWA]; % WL x 5
+    Fit_ABS_cor = (ABS_SW(:,t_fit))';
+else
+    M     = [Fit_ENO3 Ones/100 Fit_WL/1000]; % WL x 3
+    Fit_ABS_cor = (ABS_cor(:,t_fit))'; % NO3 + BL. Transposed, now WL x sample
+end
+
+% Matrix pseudo-inverse
 M_INV = pinv(M);
 
 colsM = size(M,2); % Columns may need to be added if more unknowns
-
 NO3 = ones(rows, colsM +3)* NaN; % # samples x (# fit parameters + QC values)
+S = ones(rows, 1)* NaN; % # samples x 1
+TS = ones(rows, 1)* NaN; % # samples x 1
+
 for i = 1:rows
     tg = ~tPIX_SAT(i,t_fit)'; % non saturated intensities for sample i, n x 1
     m_inv = M_INV; % default unless saturated pixels
@@ -276,16 +294,36 @@ for i = 1:rows
         m_inv = pinv(M(tg,:)); % subset to non saturated WL's in M
     end
 
-    % NO3 = [ baseline intercept, and slope]
-    NO3(i,1:3) = m_inv * Fit_ABS_cor(tg,i);
-    NO3(i,2) = NO3(i,2)/100; % baseline intercept
-    NO3(i,3) = NO3(i,3)/1000; % baseline slope
-    
-    ABS_BL  = WL(1,:) .* NO3(i,3) + NO3(i,2); % Baseline absorbance
-    ABS_NO3 = ABS_cor(i,:) - ABS_BL; % Calculated nitrate absorbance
-    ABS_NO3_EXP = ENO3 .* NO3(i,1);
-    
-    FIT_DIF = ABS_cor(i,:) - ABS_BL -ABS_NO3_EXP;
+
+    if (strcmp(ncal.TSalgorithm, 'None'))
+        % NO3 = [ baseline intercept,  slope, ESW, TSWA]
+        NO3(i,1:colsM) = m_inv * Fit_ABS_cor(tg,i);
+        NO3(i,2) = NO3(i,2)/100; % baseline intercept
+        NO3(i,3) = NO3(i,3)/1000; % baseline slope
+
+        S(i,1)   = NO3(i,4);  % Salinity
+        TS(i, 1) = NO3(i,5); % TSWA
+        
+        ABS_BL  = WL(1,:) .* NO3(i,3) + NO3(i,2); % Baseline absorbance
+        ABS_S_EXP = ESW .* S(i,1); 
+        ABS_TS_EXP = ESW .* TS(i,1); 
+        ABS_NO3 = ABS_SW(i,:) - ABS_BL - ABS_S_EXP - ABS_TS_EXP; % Calculated nitrate absorbance
+        ABS_NO3_EXP = ENO3 .* NO3(i,1);
+        
+        
+        FIT_DIF = ABS_SW(i,:) - ABS_BL - ABS_NO3_EXP - ABS_S_EXP - ABS_TS_EXP;
+    else
+        % NO3 = [ baseline intercept, and slope]
+        NO3(i,1:3) = m_inv * Fit_ABS_cor(tg,i);  % (#fit params x #WL) X (#WL x #sammples) = (#fit params x #samples)
+        NO3(i,2) = NO3(i,2)/100; % baseline intercept
+        NO3(i,3) = NO3(i,3)/1000; % baseline slope
+        
+        ABS_BL  = WL(1,:) .* NO3(i,3) + NO3(i,2); % Baseline absorbance
+        ABS_NO3 = ABS_cor(i,:) - ABS_BL; % Calculated nitrate absorbance
+        ABS_NO3_EXP = ENO3 .* NO3(i,1);
+        
+        FIT_DIF = ABS_cor(i,:) - ABS_BL -ABS_NO3_EXP;
+    end
     FIT_DIF_tfit = FIT_DIF(t_fit);
     RMS_ERROR = sqrt((sum(FIT_DIF_tfit(tg').^2)./sum(t_fit(tg))));
     ind_240  = find(Fit_WL <= 240,1,'last');
@@ -299,8 +337,8 @@ for i = 1:rows
     % ********************************************************************
     %     if RMS_ERROR > 0.003 || ABS_240(2) > 0.8 % ONLY PLOT IF NOT GOOD
     if fig_flag == 1 && ~all(isnan(ABS_NO3))
-        clf
-        figure(1)
+        % clf
+        figure(1);clf;
         set(gcf, 'Units', 'normalized');
         set(gcf,'Position',[0.17 0.23 0.52 0.55])
         a1 = axes('Position', [0.13 0.12 0.775 0.59]);
@@ -314,10 +352,19 @@ for i = 1:rows
         ylabel('Absorbance','FontSize', 14)
         set(gca, 'FontSize', 14)
         
-        plot(WL(1,:), ABS_BL, 'g-','LineWidth', 2) % BL
-        plot(WL(1,:), ABS_Br_tcor(i,:)+ABS_BL, 'b-','LineWidth', 2) % Br spectrum
-        plot(WL(1,:), ABS_cor(i,:), 'ro','LineWidth', 1) % NO3+BL observed
-        plot(WL(1,:), ABS_NO3_EXP +ABS_BL, 'r-','LineWidth', 2) % NO3+BL exp
+        if (strcmp(ncal.TSalgorithm, 'None'))
+            plot(WL(1,:), ABS_BL, 'g-','LineWidth', 2) % BL
+            plot(WL(1,:), ABS_S_EXP, 'c-','LineWidth', 2) % BL
+            plot(WL(1,:), ABS_TS_EXP, 'm-','LineWidth', 2) % BL
+            plot(WL(1,:), ABS_SW(i,:), 'ro','LineWidth', 1) % NO3+BL observed
+            plot(WL(1,:), ABS_NO3_EXP + ABS_S_EXP + ABS_TS_EXP + ABS_BL, 'r-','LineWidth', 2) % NO3+BL exp
+        else
+            plot(WL(1,:), ABS_BL, 'g-','LineWidth', 2) % BL
+            plot(WL(1,:), ABS_Br_tcor(i,:)+ABS_BL, 'b-','LineWidth', 2) % Br spectrum
+            plot(WL(1,:), ABS_cor(i,:), 'ro','LineWidth', 1) % NO3+BL observed
+            plot(WL(1,:), ABS_NO3_EXP +ABS_BL, 'r-','LineWidth', 2) % NO3+BL exp
+        end
+
         
         y_lim = ylim;
         ylim(y_lim)
@@ -331,7 +378,7 @@ for i = 1:rows
             num2str(d.P(i),'%0.1f')],['FIT WINDOW (',num2str(Fit_WL(1), ...
             '%4.1f'),' - ', num2str(Fit_WL(end),'%4.1f'),')'], ...
             ['NO3 = ', num2str(NO3(i,1),'%2.1f'), ' ?M'], ...
-            ['RMS error = ', num2str(NO3(i,4),'%2.3e')], ...
+            ['RMS error = ', num2str(RMS_ERROR,'%2.3e')], ...
             ['CTD T = ', num2str(d.T(i),'%2.1f')], ...
             ['CAN T = ', num2str(d.CAN_T(i),'%2.1f')]};
         
